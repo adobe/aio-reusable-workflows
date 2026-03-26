@@ -31,7 +31,7 @@ jobs:
     - run: npm test
     - name: upload coverage
       if: success()
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v6
       with:
         name: ${{ runner.os }} node.js ${{ matrix.node-version }}
         token: ${{ secrets.CODECOV_TOKEN }}
