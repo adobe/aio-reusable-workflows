@@ -32,6 +32,7 @@ async function main () {
 
 // ── GitHub API helpers ────────────────────────────────────────────────────────
 
+// Generic authenticated GET against the GitHub API, returns parsed JSON
 async function githubGet (url) {
   const res = await fetch(url, {
     headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
@@ -40,6 +41,7 @@ async function githubGet (url) {
   return res.json()
 }
 
+// Fetches the raw unified diff for the PR
 async function getPRDiff () {
   const res = await fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}`, {
     headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept: 'application/vnd.github.diff' }
@@ -48,6 +50,7 @@ async function getPRDiff () {
   return res.text()
 }
 
+// Extracts inline comments from the most recent bot review to enable re-raise logic
 async function getPreviousSuggestions () {
   const reviews = await githubGet(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews`)
   const botReviews = reviews.filter(r => r.body && r.body.includes(BOT_REVIEW_MARKER))
@@ -60,6 +63,7 @@ async function getPreviousSuggestions () {
   return comments.map(c => ({ file: c.path, line: c.original_line || c.line, comment: c.body }))
 }
 
+// Dismisses any previous REQUEST_CHANGES bot reviews so the new one is the only active review
 async function cleanupPreviousReviews () {
   const reviews = await githubGet(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews`)
   const botReviews = reviews.filter(r => r.body && r.body.includes(BOT_REVIEW_MARKER))
@@ -79,6 +83,7 @@ async function cleanupPreviousReviews () {
   }
 }
 
+// Posts the review with summary, approval state, and inline comments; falls back to COMMENT if inline comments are rejected
 async function postReview (review) {
   const { summary, approved, suggestions = [] } = review
   const event = approved ? 'APPROVE' : suggestions.length > 0 ? 'REQUEST_CHANGES' : 'COMMENT'
@@ -135,8 +140,8 @@ async function postReview (review) {
 
 // ── Bedrock / Claude ──────────────────────────────────────────────────────────
 
+// Discovers the latest available Claude Sonnet model; prefers inference profiles (required for Claude 4.x), falls back to foundation models
 async function pickLatestModel () {
-  // Prefer inference profiles (required for Claude 4.x)
   try {
     const res = await fetch(`https://bedrock.${AWS_REGION}.amazonaws.com/inference-profiles?type=SYSTEM_DEFINED`, {
       headers: { Authorization: `Bearer ${AWS_BEARER_TOKEN_BEDROCK}` }
@@ -167,6 +172,7 @@ async function pickLatestModel () {
   return models[0]
 }
 
+// Calls Claude via Bedrock, parses the JSON review response
 async function callClaude (diff, previousSuggestions) {
   const prompt = buildPrompt(diff, previousSuggestions)
   const modelId = await pickLatestModel()
@@ -191,6 +197,7 @@ async function callClaude (diff, previousSuggestions) {
   }
 }
 
+// Builds the prompt instructing Claude to return a strict JSON review object
 function buildPrompt (diff, previousSuggestions) {
   let prompt = `You are a code review bot. Output RAW JSON only - no markdown, no code fences, no explanation.
 

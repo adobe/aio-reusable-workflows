@@ -24,14 +24,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Check commenter permission (issue_comment only)
+        if: github.event_name == 'issue_comment'
+        id: perm
+        run: |
+          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission')
+          echo "level=$PERM" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Checkout aio-reusable-workflows
+        if: github.event_name == 'pull_request' || steps.perm.outputs.level == 'admin'
         uses: actions/checkout@v4
         with:
           repository: adobe/aio-reusable-workflows
-          ref: reviewer-bot-poc
+          ref: main
           path: .aio-rw
 
       - name: Run PR review
+        if: github.event_name == 'pull_request' || steps.perm.outputs.level == 'admin'
         run: node .aio-rw/.github/scripts/pr-review.js
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
