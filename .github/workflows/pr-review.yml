@@ -2,6 +2,17 @@ name: PR Review (Reusable)
 
 on:
   workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      aws_region:
+        required: false
+        type: string
+        default: us-east-1
     secrets:
       AWS_BEARER_TOKEN_BEDROCK:
         required: true
@@ -9,46 +20,29 @@ on:
 jobs:
   review:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - name: Get PR info
-        id: pr
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
-            echo "sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
-          else
-            DATA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }})
-            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
-            echo "sha=$(echo "$DATA" | jq -r '.head.sha')" >> $GITHUB_OUTPUT
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check commenter permission (issue_comment only)
-        if: github.event_name == 'issue_comment'
-        id: perm
-        run: |
-          PERM=$(gh api repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission --jq '.permission')
-          echo "level=$PERM" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
       - name: Checkout aio-reusable-workflows
-        if: github.event_name == 'pull_request' || steps.perm.outputs.level == 'admin'
         uses: actions/checkout@v4
         with:
           repository: adobe/aio-reusable-workflows
-          ref: main
+          ref: reviewer-bot-poc
           path: .aio-rw
 
       - name: Run PR review
-        if: github.event_name == 'pull_request' || steps.perm.outputs.level == 'admin'
         run: node .aio-rw/.github/scripts/pr-review.js
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
-          AWS_REGION: us-east-1
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+          AWS_REGION: ${{ inputs.aws_region }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          # GITHUB_REPOSITORY is set automatically by GitHub Actions (owner/repo)

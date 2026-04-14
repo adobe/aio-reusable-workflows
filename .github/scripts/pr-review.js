@@ -3,24 +3,30 @@ const BOT_REVIEW_MARKER = '🤖 PR Reviewer'
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN
 const AWS_BEARER_TOKEN_BEDROCK = process.env.AWS_BEARER_TOKEN_BEDROCK
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1'
-const PR_NUMBER = parseInt(process.env.PR_NUMBER)
-const REPO_OWNER = process.env.REPO_OWNER
-const REPO_NAME = process.env.REPO_NAME
+const PR_NUMBER = parseInt(process.env.PR_NUMBER, 10)
 const HEAD_SHA = process.env.HEAD_SHA
+const [REPO_OWNER, REPO_NAME] = (process.env.GITHUB_REPOSITORY || '').split('/')
 
 async function main () {
   try {
+    const missing = ['GITHUB_TOKEN', 'AWS_BEARER_TOKEN_BEDROCK', 'PR_NUMBER', 'GITHUB_REPOSITORY', 'HEAD_SHA']
+      .filter(k => !process.env[k])
+    if (missing.length) throw new Error(`Missing required env vars: ${missing.join(', ')}`)
+    if (isNaN(PR_NUMBER)) throw new Error(`Invalid PR_NUMBER: "${process.env.PR_NUMBER}"`)
+
     console.log(`Reviewing PR #${PR_NUMBER} on ${REPO_OWNER}/${REPO_NAME}`)
 
     const diff = await getPRDiff()
     if (!diff || diff.length < 10) { console.log('No diff to review'); return }
+    if (diff.length > 100000) console.warn(`Diff truncated: ${diff.length} → 100000 chars`)
 
-    const previousSuggestions = await getPreviousSuggestions()
+    const botReviews = await getBotReviews()
+    const previousSuggestions = await getPreviousSuggestions(botReviews)
     console.log(`Found ${previousSuggestions.length} previous suggestions`)
 
     const review = await callClaude(diff, previousSuggestions)
 
-    await cleanupPreviousReviews()
+    await cleanupPreviousReviews(botReviews)
     await postReview(review)
 
     console.log('Review posted successfully')
@@ -32,58 +38,78 @@ async function main () {
 
 // ── GitHub API helpers ────────────────────────────────────────────────────────
 
+// Retries on transient errors with exponential backoff; respects Retry-After header when present
+// retry403: true for GitHub calls (403 = secondary rate limit); false for Bedrock (403 = bad credentials, permanent)
+async function fetchWithRetry (url, options, retries = 3, retry403 = false) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, options)
+    const isTransient = res.status === 429 || (retry403 && res.status === 403) || res.status >= 500
+    if (!isTransient || attempt === retries) return res
+    const retryAfter = res.headers.get('retry-after')
+    const wait = retryAfter ? parseInt(retryAfter, 10) * 1000 : 1000 * Math.pow(2, attempt)
+    console.warn(`Request failed (${res.status}), retrying in ${wait}ms`)
+    await new Promise(r => setTimeout(r, wait))
+  }
+}
+
 // Generic authenticated GET against the GitHub API, returns parsed JSON
 async function githubGet (url) {
-  const res = await fetch(url, {
+  const res = await fetchWithRetry(url, {
     headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' }
-  })
+  }, 3, true)
   if (!res.ok) throw new Error(`GitHub API error: ${res.status} ${url}`)
   return res.json()
 }
 
 // Fetches the raw unified diff for the PR
 async function getPRDiff () {
-  const res = await fetch(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}`, {
+  const res = await fetchWithRetry(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}`, {
     headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept: 'application/vnd.github.diff' }
-  })
+  }, 3, true)
   if (!res.ok) throw new Error(`Failed to fetch diff: ${res.status}`)
   return res.text()
 }
 
-// Extracts inline comments from the most recent bot review to enable re-raise logic
-async function getPreviousSuggestions () {
+// Fetches all reviews for the PR and filters to bot-authored ones
+async function getBotReviews () {
   const reviews = await githubGet(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews`)
-  const botReviews = reviews.filter(r => r.body && r.body.includes(BOT_REVIEW_MARKER))
+  return reviews.filter(r => r.user?.login === 'github-actions[bot]' && r.body?.includes(BOT_REVIEW_MARKER))
+}
+
+// Extracts inline comments from the most recent bot review to enable re-raise logic
+async function getPreviousSuggestions (botReviews) {
   if (!botReviews.length) return []
 
   const latest = botReviews[botReviews.length - 1]
   const comments = await githubGet(
     `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews/${latest.id}/comments`
   )
-  return comments.map(c => ({ file: c.path, line: c.original_line || c.line, comment: c.body }))
+  return comments.map(c => ({ file: c.path, line: c.line, comment: c.body }))
 }
 
-// Dismisses any previous REQUEST_CHANGES bot reviews so the new one is the only active review
-async function cleanupPreviousReviews () {
-  const reviews = await githubGet(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews`)
-  const botReviews = reviews.filter(r => r.body && r.body.includes(BOT_REVIEW_MARKER))
-
+// Dismisses all previous bot reviews (CHANGES_REQUESTED and APPROVED) so the new one is the only active review
+async function cleanupPreviousReviews (botReviews) {
   for (const review of botReviews) {
-    if (review.state === 'REQUEST_CHANGES') {
-      await fetch(
+    if (['CHANGES_REQUESTED', 'APPROVED'].includes(review.state)) {
+      const res = await fetchWithRetry(
         `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews/${review.id}/dismissals`,
         {
           method: 'PUT',
           headers: { Authorization: `token ${GITHUB_TOKEN}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: 'Superseded by new review' })
-        }
+        },
+        3, true
       )
-      console.log(`Dismissed previous review ${review.id}`)
+      if (res.ok) {
+        console.log(`Dismissed previous review ${review.id}`)
+      } else {
+        console.warn(`Failed to dismiss review ${review.id}: ${res.status} — proceeding to post new review`)
+      }
     }
   }
 }
 
-// Posts the review with summary, approval state, and inline comments; falls back to COMMENT if inline comments are rejected
+// Posts the review with summary, approval state, and inline comments; falls back without inline comments on 422
 async function postReview (review) {
   const { summary, approved, suggestions = [] } = review
   const event = approved ? 'APPROVE' : suggestions.length > 0 ? 'REQUEST_CHANGES' : 'COMMENT'
@@ -107,31 +133,35 @@ async function postReview (review) {
   const comments = suggestions
     .filter(s => s.file && s.line)
     .map(s => {
-      const c = { path: s.file, line: s.line, body: s.comment + (s.suggestion ? `\n\n\`\`\`suggestion\n${s.suggestion}\n\`\`\`` : '') }
-      if (s.start_line) c.start_line = s.start_line
+      const c = {
+        path: s.file,
+        line: s.line,
+        side: 'RIGHT',
+        body: s.comment + (s.suggestion ? `\n\n\`\`\`suggestion\n${s.suggestion}\n\`\`\`` : '')
+      }
+      if (s.start_line) {
+        c.start_line = s.start_line
+        c.start_side = 'RIGHT'
+      }
       return c
     })
 
-  const post = async (withComments, overrideEvent) => fetch(
+  const post = async (withComments, overrideEvent) => fetchWithRetry(
     `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews`,
     {
       method: 'POST',
       headers: { Authorization: `token ${GITHUB_TOKEN}`, 'Content-Type': 'application/json', Accept: 'application/vnd.github+json' },
       body: JSON.stringify({ commit_id: HEAD_SHA, body, event: overrideEvent || event, comments: withComments ? comments : [] })
-    }
+    },
+    3, true
   )
 
   let res = await post(true)
 
+  // On 422, fall back to COMMENT without inline comments — handles both own-PR and lines-not-in-diff cases
   if (res.status === 422 && comments.length > 0) {
-    const errText = await res.text()
-    if (errText.includes('own pull request')) {
-      console.warn('Cannot request changes on own PR, retrying as COMMENT')
-      res = await post(false, 'COMMENT')
-    } else {
-      console.warn('Inline comments failed, retrying without them')
-      res = await post(false)
-    }
+    console.warn('Inline comments rejected (422), retrying as COMMENT without inline comments')
+    res = await post(false, 'COMMENT')
   }
 
   if (!res.ok) throw new Error(`Failed to post review: ${res.status} ${await res.text()}`)
@@ -143,7 +173,7 @@ async function postReview (review) {
 // Discovers the latest available Claude Sonnet model; prefers inference profiles (required for Claude 4.x), falls back to foundation models
 async function pickLatestModel () {
   try {
-    const res = await fetch(`https://bedrock.${AWS_REGION}.amazonaws.com/inference-profiles?type=SYSTEM_DEFINED`, {
+    const res = await fetchWithRetry(`https://bedrock.${AWS_REGION}.amazonaws.com/inference-profiles?type=SYSTEM_DEFINED`, {
       headers: { Authorization: `Bearer ${AWS_BEARER_TOKEN_BEDROCK}` }
     })
     if (res.ok) {
@@ -158,9 +188,10 @@ async function pickLatestModel () {
     console.warn('Inference profiles lookup failed, trying foundation models:', e.message)
   }
 
-  const res = await fetch(`https://bedrock.${AWS_REGION}.amazonaws.com/foundation-models`, {
+  const res = await fetchWithRetry(`https://bedrock.${AWS_REGION}.amazonaws.com/foundation-models`, {
     headers: { Authorization: `Bearer ${AWS_BEARER_TOKEN_BEDROCK}` }
   })
+  if (!res.ok) throw new Error(`Bedrock foundation-models error: ${res.status} ${await res.text()}`)
   const data = await res.json()
   const models = (data.modelSummaries || [])
     .filter(m => m.modelId.includes('anthropic.claude') && m.modelId.includes('sonnet') &&
@@ -174,35 +205,41 @@ async function pickLatestModel () {
 
 // Calls Claude via Bedrock, parses the JSON review response
 async function callClaude (diff, previousSuggestions) {
-  const prompt = buildPrompt(diff, previousSuggestions)
+  const { system, user } = buildPrompt(diff, previousSuggestions)
   const modelId = await pickLatestModel()
 
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `https://bedrock-runtime.${AWS_REGION}.amazonaws.com/model/${encodeURIComponent(modelId)}/invoke`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AWS_BEARER_TOKEN_BEDROCK}` },
-      body: JSON.stringify({ anthropic_version: 'bedrock-2023-05-31', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] })
+      body: JSON.stringify({ anthropic_version: 'bedrock-2023-05-31', max_tokens: 8192, system, messages: [{ role: 'user', content: user }] })
     }
   )
   if (!res.ok) throw new Error(`Bedrock error: ${res.status} ${await res.text()}`)
 
   const data = await res.json()
-  const text = data.content[0].text
-  console.log('Claude response preview:', text.substring(0, 200))
+  const text = data?.content?.[0]?.text
+  if (!text) throw new Error(`Unexpected Bedrock response: ${JSON.stringify(data)}`)
+  if (data.stop_reason === 'max_tokens') console.warn('Bedrock hit max_tokens — review may be incomplete')
+  console.log('Claude response received', { length: text.length })
 
-  try { return JSON.parse(text) } catch {
-    const clean = text.replace(/^```json?\n?/, '').replace(/\n?```$/, '').trim()
-    return JSON.parse(clean)
+  const match = text.match(/\{[\s\S]*\}/)
+  if (!match) throw new Error('No JSON object found in Claude response')
+  try {
+    const parsed = JSON.parse(match[0])
+    console.log('Claude response parsed successfully')
+    return parsed
+  } catch (e) {
+    throw new Error(`Failed to parse Claude response as JSON: ${e.message}`)
   }
 }
 
-// Builds the prompt instructing Claude to return a strict JSON review object
+// Builds the prompt — instructions in system turn, diff in user turn for cleaner context boundary
 function buildPrompt (diff, previousSuggestions) {
-  let prompt = `You are a code review bot. Output RAW JSON only - no markdown, no code fences, no explanation.
+  const system = `You are a code review bot. Output RAW JSON only - no markdown, no code fences, no explanation.
 
-CRITICAL: Your entire response must be a valid JSON object starting with { and ending with }
-DO NOT wrap in \`\`\`json or \`\`\` - output ONLY the raw JSON object.
+Your entire response must be a valid JSON object starting with { and ending with }.
 
 Review for: code clarity, error handling, security issues, performance, best practices.
 
@@ -222,12 +259,13 @@ RULES:
 - Omit suggestion field if unsure about exact line numbers
 - Multi-line: line count must equal (line - start_line + 1)`
 
+  let user = ''
   if (previousSuggestions.length > 0) {
-    prompt += `\n\nPREVIOUS SUGGESTIONS (re-raise with "[Re-raised] " prefix if still present):\n${JSON.stringify(previousSuggestions)}`
+    user += `PREVIOUS SUGGESTIONS (re-raise with "[Re-raised] " prefix if still present):\n${JSON.stringify(previousSuggestions)}\n\n`
   }
+  user += `Diff:\n${diff.substring(0, 100000)}`
 
-  prompt += `\n\nDiff:\n${diff.substring(0, 100000)}`
-  return prompt
+  return { system, user }
 }
 
 main()
