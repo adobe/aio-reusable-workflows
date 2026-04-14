@@ -26,8 +26,10 @@ async function main () {
 
     const review = await callClaude(diff, previousSuggestions)
 
+    // Post first so the PR always has a review even if cleanup fails;
+    // old and new reviews briefly coexist but that's preferable to leaving no review
+    await postReview(review, diff.length > 100000)
     await cleanupPreviousReviews(botReviews)
-    await postReview(review)
 
     console.log('Review posted successfully')
   } catch (err) {
@@ -42,13 +44,22 @@ async function main () {
 // retry403: true for GitHub calls (403 = secondary rate limit); false for Bedrock (403 = bad credentials, permanent)
 async function fetchWithRetry (url, options, retries = 3, retry403 = false) {
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const res = await fetch(url, options)
-    const isTransient = res.status === 429 || (retry403 && res.status === 403) || res.status >= 500
-    if (!isTransient || attempt === retries) return res
-    const retryAfter = res.headers.get('retry-after')
-    const wait = retryAfter ? parseInt(retryAfter, 10) * 1000 : 1000 * Math.pow(2, attempt)
-    console.warn(`Request failed (${res.status}), retrying in ${wait}ms`)
-    await new Promise(r => setTimeout(r, wait))
+    try {
+      const res = await fetch(url, options)
+      const isTransient = res.status === 429 || (retry403 && res.status === 403) || res.status >= 500
+      if (!isTransient || attempt === retries) return res
+      const retryAfterHeader = res.headers.get('retry-after')
+      const base = 1000 * Math.pow(2, attempt)
+      const wait = retryAfterHeader ? Number(retryAfterHeader) * 1000 : base + Math.random() * base
+      console.warn(`Request failed (${res.status}), retrying in ${wait}ms`)
+      await new Promise(r => setTimeout(r, wait))
+    } catch (err) {
+      if (attempt === retries) throw err
+      const base = 1000 * Math.pow(2, attempt)
+      const wait = base + Math.random() * base
+      console.warn(`Request error (${err.message}), retrying in ${wait}ms`)
+      await new Promise(r => setTimeout(r, wait))
+    }
   }
 }
 
@@ -84,7 +95,8 @@ async function getPreviousSuggestions (botReviews) {
   const comments = await githubGet(
     `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews/${latest.id}/comments`
   )
-  return comments.map(c => ({ file: c.path, line: c.line, comment: c.body }))
+  // original_line is stable across pushes; line can be null if the hunk moved
+  return comments.map(c => ({ file: c.path, line: c.original_line ?? c.line, comment: c.body }))
 }
 
 // Dismisses all previous bot reviews (CHANGES_REQUESTED and APPROVED) so the new one is the only active review
@@ -103,14 +115,14 @@ async function cleanupPreviousReviews (botReviews) {
       if (res.ok) {
         console.log(`Dismissed previous review ${review.id}`)
       } else {
-        console.warn(`Failed to dismiss review ${review.id}: ${res.status} — proceeding to post new review`)
+        console.warn(`Failed to dismiss review ${review.id}: ${res.status} — old review may still appear`)
       }
     }
   }
 }
 
 // Posts the review with summary, approval state, and inline comments; falls back without inline comments on 422
-async function postReview (review) {
+async function postReview (review, diffTruncated = false) {
   const { summary, approved, suggestions = [] } = review
   const event = approved ? 'APPROVE' : suggestions.length > 0 ? 'REQUEST_CHANGES' : 'COMMENT'
 
@@ -128,6 +140,9 @@ async function postReview (review) {
       body += `\n\n📝 **${suggestions.length} suggestion(s)** - Please review inline comments below.`
     }
   }
+  if (diffTruncated) {
+    body += '\n\n> ⚠️ _Diff exceeded 100 000 chars and was truncated — some files may not have been reviewed._'
+  }
   body += '\n\n---\n<details>\n<summary>💡 How to re-trigger</summary>\n\nComment `/review` or `/pr-reviewer` on this PR\n</details>'
 
   const comments = suggestions
@@ -139,36 +154,45 @@ async function postReview (review) {
         side: 'RIGHT',
         body: s.comment + (s.suggestion ? `\n\n\`\`\`suggestion\n${s.suggestion}\n\`\`\`` : '')
       }
-      if (s.start_line) {
+      if (s.start_line && s.start_line < s.line) {
         c.start_line = s.start_line
         c.start_side = 'RIGHT'
       }
       return c
     })
 
-  const post = async (withComments, overrideEvent) => fetchWithRetry(
+  const post = async (withComments, overrideEvent, overrideBody) => fetchWithRetry(
     `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews`,
     {
       method: 'POST',
       headers: { Authorization: `token ${GITHUB_TOKEN}`, 'Content-Type': 'application/json', Accept: 'application/vnd.github+json' },
-      body: JSON.stringify({ commit_id: HEAD_SHA, body, event: overrideEvent || event, comments: withComments ? comments : [] })
+      body: JSON.stringify({ commit_id: HEAD_SHA, body: overrideBody || body, event: overrideEvent || event, comments: withComments ? comments : [] })
     },
     3, true
   )
 
   let res = await post(true)
+  let postedEvent = event
 
-  // On 422, fall back to COMMENT without inline comments — handles both own-PR and lines-not-in-diff cases
   if (res.status === 422 && comments.length > 0) {
-    console.warn('Inline comments rejected (422), retrying as COMMENT without inline comments')
-    res = await post(false, 'COMMENT')
+    // Stage 1: inline comments reference lines not in diff — retry with original event but no comments
+    // Pass fallbackBody explicitly rather than mutating body, so intent is clear and post() stays pure
+    console.warn('Inline comments rejected (422), retrying without inline comments')
+    const fallbackBody = body + '\n\n> ⚠️ _Inline comments could not be attached (lines not in diff). See summary above._'
+    res = await post(false, undefined, fallbackBody)
+    if (res.status === 422) {
+      // Stage 2: own-PR case — GitHub requires COMMENT event when reviewing your own PR
+      console.warn('Review rejected again (422), posting as COMMENT (own PR?)')
+      postedEvent = 'COMMENT'
+      res = await post(false, 'COMMENT', fallbackBody)
+    }
   }
 
   if (!res.ok) throw new Error(`Failed to post review: ${res.status} ${await res.text()}`)
-  console.log(`Review posted — ${event}`)
+  console.log(`Review posted — ${postedEvent}`)
 }
 
-// ── Bedrock / Claude ──────────────────────────────────────────────────────────
+// Bedrock / Claude
 
 // Discovers the latest available Claude Sonnet model; prefers inference profiles (required for Claude 4.x), falls back to foundation models
 async function pickLatestModel () {
@@ -220,19 +244,19 @@ async function callClaude (diff, previousSuggestions) {
 
   const data = await res.json()
   const text = data?.content?.[0]?.text
-  if (!text) throw new Error(`Unexpected Bedrock response: ${JSON.stringify(data)}`)
+  if (!text) throw new Error(`Unexpected Bedrock response — keys: ${Object.keys(data || {}).join(', ')}, stop_reason: ${data?.stop_reason}`)
   if (data.stop_reason === 'max_tokens') console.warn('Bedrock hit max_tokens — review may be incomplete')
   console.log('Claude response received', { length: text.length })
 
-  const match = text.match(/\{[\s\S]*\}/)
-  if (!match) throw new Error('No JSON object found in Claude response')
-  try {
-    const parsed = JSON.parse(match[0])
-    console.log('Claude response parsed successfully')
-    return parsed
-  } catch (e) {
-    throw new Error(`Failed to parse Claude response as JSON: ${e.message}`)
+  // Try parsing from each { in order — greedy regex fails when Claude outputs prose containing {} before the JSON
+  for (const m of text.matchAll(/\{/g)) {
+    try {
+      const parsed = JSON.parse(text.slice(m.index))
+      console.log('Claude response parsed successfully')
+      return parsed
+    } catch {}
   }
+  throw new Error('No valid JSON object found in Claude response')
 }
 
 // Builds the prompt — instructions in system turn, diff in user turn for cleaner context boundary
