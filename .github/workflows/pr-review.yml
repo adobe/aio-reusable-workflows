@@ -1,0 +1,42 @@
+name: PR Review (Reusable)
+
+on:
+  workflow_call:
+    secrets:
+      AWS_BEARER_TOKEN_BEDROCK:
+        required: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get PR info
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "sha=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+          else
+            DATA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }})
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "sha=$(echo "$DATA" | jq -r '.head.sha')" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout aio-reusable-workflows
+        uses: actions/checkout@v4
+        with:
+          repository: adobe/aio-reusable-workflows
+          path: .aio-rw
+
+      - name: Run PR review
+        run: node .aio-rw/.github/scripts/pr-review.js
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          AWS_REGION: us-east-1
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
