@@ -30,9 +30,16 @@ jobs:
     - run: npm run build --if-present
     - run: npm test
     - name: upload coverage
-      if: success()
+      if: success() && github.actor != 'dependabot[bot]'
       uses: codecov/codecov-action@v4
       with:
         name: ${{ runner.os }} node.js ${{ matrix.node-version }}
         token: ${{ secrets.CODECOV_TOKEN }}
         fail_ci_if_error: false
+    - name: save coverage artifact
+      if: github.actor == 'dependabot[bot]'
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report-${{ matrix.os }}-${{ matrix.node-version }}
+        path: coverage/lcov.info
+        if-no-files-found: warn
