@@ -1,0 +1,74 @@
+name: Dependabot Coverage Upload
+
+on:
+  workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: dependabot-coverage-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Get PR head SHA
+        id: pr
+        run: |
+          set -euo pipefail
+          SHA=$(gh api repos/$GITHUB_REPOSITORY/pulls/$ISSUE_NUMBER --jq '.head.sha')
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+
+      - name: Find original CI run
+        id: run
+        run: |
+          set -euo pipefail
+          RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq "[.artifacts[] | select(.name | startswith(\"coverage-report-\")) | select(.workflow_run.head_sha == \"$HEAD_SHA\")] | first | .workflow_run.id")
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "run_id=" >> $GITHUB_OUTPUT
+          else
+            echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+
+      - name: Download coverage artifacts
+        if: steps.run.outputs.run_id != ''
+        id: download
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-report-*
+          run-id: ${{ steps.run.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Upload to Codecov
+        if: steps.download.outcome == 'success'
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: '**/lcov.info'
+          fail_ci_if_error: false
+
+      - name: Comment — success
+        if: steps.download.outcome == 'success'
+        run: gh pr comment $ISSUE_NUMBER --repo $GITHUB_REPOSITORY --edit-last --body "Coverage uploaded to Codecov successfully." 2>/dev/null || gh pr comment $ISSUE_NUMBER --repo $GITHUB_REPOSITORY --body "Coverage uploaded to Codecov successfully."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+
+      - name: Comment — artifact missing
+        if: steps.run.outputs.run_id == '' || steps.download.outcome == 'failure'
+        run: gh pr comment $ISSUE_NUMBER --repo $GITHUB_REPOSITORY --edit-last --body "Coverage artifact not found. Re-run CI first, then comment \`/upload-coverage\` again." 2>/dev/null || gh pr comment $ISSUE_NUMBER --repo $GITHUB_REPOSITORY --body "Coverage artifact not found. Re-run CI first, then comment \`/upload-coverage\` again."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
