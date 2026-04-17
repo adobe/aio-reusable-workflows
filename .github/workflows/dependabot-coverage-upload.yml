@@ -61,14 +61,14 @@ jobs:
 
       - name: Comment — success
         if: steps.download.outcome == 'success'
-        run: gh pr comment $ISSUE_NUMBER --edit-last --body "Coverage uploaded to Codecov successfully."
+        run: gh pr comment $ISSUE_NUMBER --repo $GITHUB_REPOSITORY --edit-last --body "Coverage uploaded to Codecov successfully."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
 
       - name: Comment — artifact missing
         if: steps.run.outputs.run_id == '' || steps.download.outcome == 'failure'
-        run: gh pr comment $ISSUE_NUMBER --edit-last --body "Coverage artifact not found. Re-run CI first, then comment \`/upload-coverage\` again."
+        run: gh pr comment $ISSUE_NUMBER --repo $GITHUB_REPOSITORY --edit-last --body "Coverage artifact not found. Re-run CI first, then comment \`/upload-coverage\` again."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
