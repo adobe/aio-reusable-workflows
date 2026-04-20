@@ -57,6 +57,8 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: '**/lcov.info'
+          override_pr: ${{ github.event.issue.number }}
+          override_commit: ${{ steps.pr.outputs.sha }}
           fail_ci_if_error: false
 
       - name: Comment — success
