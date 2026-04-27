@@ -36,8 +36,9 @@ jobs:
         id: run
         run: |
           set -euo pipefail
+          # per_page=100 covers all recent artifacts; sorted newest-first by default
           RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-            --jq "[.artifacts[] | select(.name | startswith(\"coverage-report-\")) | select(.workflow_run.head_sha == \"$HEAD_SHA\")] | first | .workflow_run.id")
+            --jq "[.artifacts[] | select(.name | startswith(\"coverage-report-ubuntu-latest-\")) | select(.workflow_run.head_sha == \"$HEAD_SHA\")] | first | .workflow_run.id")
           if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
             echo "run_id=" >> $GITHUB_OUTPUT
           else
