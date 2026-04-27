@@ -14,6 +14,7 @@ jobs:
       cancel-in-progress: true
     permissions:
       actions: read
+      contents: read
       pull-requests: write
     steps:
       - name: Get PR head SHA
@@ -26,12 +27,18 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
 
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+
       - name: Find original CI run
         id: run
         run: |
           set -euo pipefail
+          # per_page=100 covers all recent artifacts; sorted newest-first by default
           RUN_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-            --jq "[.artifacts[] | select(.name | startswith(\"coverage-report-\")) | select(.workflow_run.head_sha == \"$HEAD_SHA\")] | first | .workflow_run.id")
+            --jq "[.artifacts[] | select(.name | startswith(\"coverage-report-ubuntu-latest-\")) | select(.workflow_run.head_sha == \"$HEAD_SHA\")] | first | .workflow_run.id")
           if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
             echo "run_id=" >> $GITHUB_OUTPUT
           else
@@ -46,7 +53,7 @@ jobs:
         id: download
         uses: actions/download-artifact@v4
         with:
-          pattern: coverage-report-*
+          pattern: coverage-report-ubuntu-latest-*
           run-id: ${{ steps.run.outputs.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
@@ -57,6 +64,8 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: '**/lcov.info'
+          override_pr: ${{ github.event.issue.number }}
+          override_commit: ${{ steps.pr.outputs.sha }}
           fail_ci_if_error: false
 
       - name: Comment — success
