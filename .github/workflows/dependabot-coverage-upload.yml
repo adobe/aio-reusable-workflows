@@ -14,6 +14,7 @@ jobs:
       cancel-in-progress: true
     permissions:
       actions: read
+      contents: read
       pull-requests: write
     steps:
       - name: Get PR head SHA
@@ -25,6 +26,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
 
       - name: Find original CI run
         id: run
