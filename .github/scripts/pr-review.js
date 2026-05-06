@@ -256,6 +256,7 @@ async function callClaude (diff, previousSuggestions) {
       return parsed
     } catch {}
   }
+  console.error('Claude raw response (first 1000 chars):', text.slice(0, 1000))
   throw new Error('No valid JSON object found in Claude response')
 }
 
