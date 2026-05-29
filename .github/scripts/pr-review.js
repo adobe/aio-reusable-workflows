@@ -129,28 +129,6 @@ async function cleanupPreviousReviews (botReviews) {
       })
   )
 
-  if (!botReviews.length) return
-
-  const botCommentSets = await Promise.all(
-    botReviews.map(r => githubGet(`${GITHUB_REPO_URL}/pulls/${PR_NUMBER}/reviews/${r.id}/comments`))
-  )
-  const botCommentIds = new Set(botCommentSets.flat().map(c => c.id))
-  if (!botCommentIds.size) return
-
-  const allComments = await githubGet(`${GITHUB_REPO_URL}/pulls/${PR_NUMBER}/comments`)
-  const toDelete = allComments.filter(c => botCommentIds.has(c.id) || botCommentIds.has(c.in_reply_to_id))
-
-  await Promise.all(
-    toDelete.map(async c => {
-      const res = await fetchWithRetry(
-        `${GITHUB_REPO_URL}/pulls/comments/${c.id}`,
-        { method: 'DELETE', headers: { Authorization: `token ${GITHUB_TOKEN}` } },
-        3, true
-      )
-      if (res.ok || res.status === 404) console.log(`Deleted comment ${c.id}`)
-      else console.warn(`Failed to delete comment ${c.id}: ${res.status}`)
-    })
-  )
 }
 
 function getValidDiffLines (diff) {
