@@ -293,7 +293,9 @@ function repairJSON (s) {
     .replace(/(\d)"([,}\]])/g, '$1$2')
     .replace(/,(\s*[}\]])/g, '$1')
     .replace(/"((?:[^"\\]|\\.)*)"/gs, (_, content) =>
-      `"${content.replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')}"`)
+      `"${content
+        .replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')
+        .replace(/\\([^"\\/bfnrtu])/g, '\\\\$1')}"`)
 }
 
 // Calls Claude via Bedrock, parses the JSON review response
@@ -319,11 +321,16 @@ async function callClaude (diff, previousSuggestions) {
   console.log('Claude response received', { length: text.length })
 
   for (const match of text.matchAll(/\{/g)) {
-    try {
-      const parsed = JSON.parse(repairJSON(text.slice(match.index)))
-      console.log('Claude response parsed successfully')
-      return parsed
-    } catch {}
+    const slice = text.slice(match.index)
+    const lastBrace = slice.lastIndexOf('}')
+    const candidates = lastBrace >= 0 ? [slice, slice.slice(0, lastBrace + 1)] : [slice]
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(repairJSON(candidate))
+        console.log('Claude response parsed successfully')
+        return parsed
+      } catch {}
+    }
   }
   console.error('Claude raw response (first 1000 chars):', text.slice(0, 1000))
   throw new Error('No valid JSON object found in Claude response')
