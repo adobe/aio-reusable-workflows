@@ -1,4 +1,5 @@
 const BOT_REVIEW_MARKER = '🤖 PR Reviewer'
+const DIFF_CHAR_LIMIT = 500000
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN
 const AWS_BEARER_TOKEN_BEDROCK = process.env.AWS_BEARER_TOKEN_BEDROCK
@@ -18,7 +19,7 @@ async function main () {
 
     const diff = await getPRDiff()
     if (!diff || diff.length < 10) { console.log('No diff to review'); return }
-    if (diff.length > 100000) console.warn(`Diff truncated: ${diff.length} → 100000 chars`)
+    if (diff.length > DIFF_CHAR_LIMIT) console.warn(`Diff truncated: ${diff.length} → ${DIFF_CHAR_LIMIT} chars`)
 
     const botReviews = await getBotReviews()
     const previousSuggestions = await getPreviousSuggestions(botReviews)
@@ -28,7 +29,7 @@ async function main () {
 
     // Post first so the PR always has a review even if cleanup fails;
     // old and new reviews briefly coexist but that's preferable to leaving no review
-    await postReview(review, diff.length > 100000)
+    await postReview(review, diff.length > DIFF_CHAR_LIMIT)
     await cleanupPreviousReviews(botReviews)
 
     console.log('Review posted successfully')
@@ -92,11 +93,25 @@ async function getPreviousSuggestions (botReviews) {
   if (!botReviews.length) return []
 
   const latest = botReviews[botReviews.length - 1]
-  const comments = await githubGet(
-    `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews/${latest.id}/comments`
-  )
+  const [comments, allComments] = await Promise.all([
+    githubGet(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/reviews/${latest.id}/comments`),
+    githubGet(`https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${PR_NUMBER}/comments`)
+  ])
+
+  const repliesByParentId = {}
+  for (const c of allComments) {
+    if (c.in_reply_to_id && c.user?.login !== 'github-actions[bot]') {
+      ;(repliesByParentId[c.in_reply_to_id] ??= []).push(c.body)
+    }
+  }
+
   // original_line is stable across pushes; line can be null if the hunk moved
-  return comments.map(c => ({ file: c.path, line: c.original_line ?? c.line, comment: c.body }))
+  return comments.map(c => {
+    const replies = repliesByParentId[c.id]
+    const entry = { file: c.path, line: c.original_line ?? c.line, comment: c.body }
+    if (replies?.length) entry.humanResponse = replies.join('\n---\n')
+    return entry
+  })
 }
 
 // Dismisses all previous bot reviews (CHANGES_REQUESTED and APPROVED) so the new one is the only active review
@@ -141,7 +156,7 @@ async function postReview (review, diffTruncated = false) {
     }
   }
   if (diffTruncated) {
-    body += '\n\n> ⚠️ _Diff exceeded 100 000 chars and was truncated — some files may not have been reviewed._'
+    body += `\n\n> ⚠️ _Diff exceeded ${DIFF_CHAR_LIMIT.toLocaleString()} chars and was truncated — some files may not have been reviewed._`
   }
   body += '\n\n---\n<details>\n<summary>💡 How to re-trigger</summary>\n\nComment `/review` or `/pr-reviewer` on this PR\n</details>'
 
@@ -237,7 +252,7 @@ async function callClaude (diff, previousSuggestions) {
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${AWS_BEARER_TOKEN_BEDROCK}` },
-      body: JSON.stringify({ anthropic_version: 'bedrock-2023-05-31', max_tokens: 8192, system, messages: [{ role: 'user', content: user }] })
+      body: JSON.stringify({ anthropic_version: 'bedrock-2023-05-31', max_tokens: 32768, system, messages: [{ role: 'user', content: user }] })
     }
   )
   if (!res.ok) throw new Error(`Bedrock error: ${res.status} ${await res.text()}`)
@@ -266,7 +281,7 @@ function buildPrompt (diff, previousSuggestions) {
 
 Your entire response must be a valid JSON object starting with { and ending with }.
 
-Review for: code clarity, error handling, security issues, performance, best practices.
+Review for: code clarity, error handling, security issues, performance, best practices. When flagging best practices, only raise it if the issue has real impact given how this code actually runs — not hypothetical scenarios, not test isolation concerns for code that doesn't run in tests, not patterns that would only matter in a different runtime context.
 
 OUTPUT FORMAT:
 {"summary":"2-3 sentence assessment","approved":true,"suggestions":[]}
@@ -286,9 +301,9 @@ RULES:
 
   let user = ''
   if (previousSuggestions.length > 0) {
-    user += `PREVIOUS SUGGESTIONS (re-raise with "[Re-raised] " prefix if still present):\n${JSON.stringify(previousSuggestions)}\n\n`
+    user += `PREVIOUS SUGGESTIONS (re-raise with "[Re-raised] " prefix if still present, but if a humanResponse is included consider the developer's explanation before deciding):\n${JSON.stringify(previousSuggestions)}\n\n`
   }
-  user += `Diff:\n${diff.substring(0, 100000)}`
+  user += `Diff:\n${diff.substring(0, DIFF_CHAR_LIMIT)}`
 
   return { system, user }
 }
