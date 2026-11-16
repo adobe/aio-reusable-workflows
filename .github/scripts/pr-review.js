@@ -293,8 +293,15 @@ async function callClaude (diff, previousSuggestions) {
 
   let data
   try { data = await res.json() } catch { throw new Error('Bedrock returned non-JSON response') }
-  const text = data?.content?.[0]?.text
-  if (!text) throw new Error(`Unexpected Bedrock response — keys: ${Object.keys(data || {}).join(', ')}, stop_reason: ${data?.stop_reason}`)
+  const content = Array.isArray(data?.content) ? data.content : []
+  const text = content
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('')
+  if (!text.trim()) {
+    const blockTypes = content.map(block => block?.type || 'unknown').join(', ') || 'none'
+    throw new Error(`Unexpected Bedrock response — keys: ${Object.keys(data || {}).join(', ')}, content block types: ${blockTypes}, stop_reason: ${data?.stop_reason}`)
+  }
   if (data.stop_reason === 'max_tokens') console.warn('Bedrock hit max_tokens — review may be incomplete')
   console.log('Claude response received', { length: text.length })
 
